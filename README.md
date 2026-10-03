@@ -30,3 +30,60 @@ Pair-wise GSB 标注任务仓库（第 16 批 / 255）。
 1. 在本仓库中完成提示词要求的全部内容。
 2. `./mvnw -q verify` 必须通过。
 3. 完成后在所属分支（A 或 B）上提交，产物快照的父提交必须是初始环境快照。
+
+---
+
+## 实现说明（分支 A）
+
+代码位于 `src/main/java/com/example/gsb/ratelimit/`，测试位于 `src/test/java/com/example/gsb/ratelimit/`。
+
+### 架构
+
+- `WindowConfig`：小格长度 `slotMillis`、每窗口格数 `slotsPerWindow`、窗口配额 `windowQuota`、中心安全余量 `safetyHeadroom`、节点预留 `nodeReserve`。
+- `Coordinator`（中心）：接收按格汇总的用量上报；窗口滚动或成员变化时按各节点**历史用量加权**分配当前窗口额度，下发 `QuotaGrant`；只分配 `windowQuota - safetyHeadroom`。
+- `Node`（节点）：本地按小格维护滑动窗口计数（只保留最近 `slotsPerWindow` 格）；以 grant 为权威，超过本地有效额度（`grant - nodeReserve`）即拒绝；当前窗口无有效 grant 时 **fail-closed**。
+- `MessageBus`：内存消息总线，支持固定延迟与确定性丢失（`droppingEveryNth`），统计投递/丢失/延迟。
+- `Cluster`：仿真装配，用 `ManualTimeSource` 手动推进时间，保证测试确定性。
+
+### 窗口对齐与时钟偏差处理
+
+所有节点以**中心时间**为唯一时间基准。中心在下发的 `QuotaGrant` 中携带发出时刻的中心小格序号 `centerSlotIndex`，节点据此计算整数格偏移 `slotOffset = centerSlotIndex - 本地小格序号`，之后本地小格一律换算为 `原始小格 + slotOffset`。效果：
+
+- 整数格级别（含跨多格）的时钟偏差被**完全校正**；
+- 不足一格的残余偏差（本地格边界与中心格边界错开）无法用整数偏移消除，理论上界为 **±1 格**，由中心安全余量与节点预留吸收；窗口中点处 ±1 格不会跨越窗口边界，因此窗口序号在窗口内部一致。
+
+### 不超发的论证与误差口径
+
+中心每窗口分配总额恒等于 `windowQuota - safetyHeadroom`；节点严格按 `grant - nodeReserve` 放行，超本地额度即拒绝；grant 延迟或丢失时节点 fail-closed（旧窗口 grant 不延续）。因此任意窗口：
+
+```
+全局通过量 ≤ Σ(各节点有效额度) ≤ windowQuota - safetyHeadroom < windowQuota
+```
+
+超发误差 = 全局通过量 − 窗口配额 ≤ 0（恒成立，误差上界即安全余量 + 各节点预留）。并发压测（16 线程 × 1 万次 × 4 节点，共 16 万次尝试）实测：通过量 9500 = 可分配额度，误差 −500（−5%），利用率 95%，见 `ConcurrencyNoOvershootTest` 输出。
+
+### 延迟/丢失容忍
+
+- 中心侧：`safetyHeadroom` 永不分出去，吸收边界效应；
+- 节点侧：`nodeReserve` 预留永不发出；
+- grant 未到达/丢失：fail-closed，宁可拒绝也不超发；
+- 上报丢失：中心按最近一次已知用量加权，不影响额度总量不变式。
+
+### 节点增删
+
+加入即发 `JoinRequest`，中心立即重平衡；退出发 `LeaveNotice`，中心回收其全部额度（含未用部分）并在存活节点间重新分配；退出节点本地残留的旧 grant 在下一窗口因窗口序号不匹配自动失效（fail-closed）。
+
+### 统计
+
+`Cluster.stats()` 汇总：各节点额度/有效额度/实际用量/拒绝数/同步 RTT、总线投递与丢失及延迟、中心授予总量、集群超发误差与利用率。
+
+### 测试覆盖（19 个用例）
+
+| 测试类 | 覆盖要求 |
+|---|---|
+| `WindowAlignmentTest` | 窗口对齐、时钟偏差校正、按格统计与滑动淘汰 |
+| `QuotaAllocationTest` | 按历史用量分配、总额不变式、超本地额度拒绝、预留不发出 |
+| `ConcurrencyNoOvershootTest` | 并发压测全局不超发并打印误差 |
+| `SyncDelayLossToleranceTest` | 同步延迟/丢失容忍、fail-closed |
+| `NodeMembershipTest` | 节点加入/退出、额度回收再分配 |
+| `StatsReportingTest` | 各项统计字段与上报链路 |
